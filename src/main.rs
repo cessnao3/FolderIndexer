@@ -127,7 +127,7 @@ impl FileDatabase {
     }
 
     pub fn save(&mut self, path: &Path) {
-        let mut file_list = self.files.iter().map(|(k, v)| (k, v)).collect::<Vec<_>>();
+        let mut file_list = self.files.iter().collect::<Vec<_>>();
         file_list.sort_by(|a, b| a.0.cmp(b.0));
 
         std::fs::write(
