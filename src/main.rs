@@ -1,10 +1,12 @@
 use clap::Parser;
 use md5::{Digest, Md5};
-use relative_path::{RelativePathBuf, RelativePath};
+use relative_path::{RelativePath, RelativePathBuf};
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     io::Read,
-    path::{Path, PathBuf}, sync::Mutex, sync::Arc,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::SystemTime,
 };
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum, Eq, PartialEq)]
@@ -95,6 +97,7 @@ fn compute_hash(p: &Path) -> String {
 struct FileDatabase {
     files: HashMap<RelativePathBuf, String>,
     change_count: usize,
+    modified_time: Option<SystemTime>,
 }
 
 impl FileDatabase {
@@ -102,6 +105,7 @@ impl FileDatabase {
         Self {
             files: HashMap::new(),
             change_count: 0,
+            modified_time: None,
         }
     }
 
@@ -114,6 +118,7 @@ impl FileDatabase {
                 .map(|(h, d)| (RelativePathBuf::from(d), h.to_string()))
                 .collect::<HashMap<_, _>>(),
             change_count: 0,
+            modified_time: path.metadata().map_or(None, |m| m.modified().ok()),
         }
     }
 
@@ -144,7 +149,8 @@ impl FileDatabase {
     }
 
     pub fn truncate_to_existing(&mut self, files: &BTreeSet<RelativePathBuf>) {
-        let remove_files = self.files
+        let remove_files = self
+            .files
             .keys()
             .filter(|k| !files.contains(*k))
             .cloned()
@@ -195,14 +201,29 @@ impl ThreadArgs {
     }
 }
 
-fn process_file(args: &ThreadArgs, f: &RelativePath) {
+fn process_file(args: &ThreadArgs, f: &RelativePath, index_mtime: Option<SystemTime>) {
     let f_path = f.to_path(&args.base_path);
 
-    let existing_hash = args.file_db.lock().unwrap().get_hash(f).map(|s| s.to_owned());
+    let existing_hash = args
+        .file_db
+        .lock()
+        .unwrap()
+        .get_hash(f)
+        .map(|s| s.to_owned());
     let mut db_hash = None;
 
     if let Some(old_hash) = existing_hash {
-        if args.existing_action != ExistingFileAction::Nothing {
+        let recompute_by_time = if let Some(it) = index_mtime {
+            if let Some(ft) = f_path.metadata().map_or(None, |m| m.modified().ok()) {
+                ft > it
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if args.existing_action != ExistingFileAction::Nothing || recompute_by_time {
             println!("Computing {f}");
             let new_hash = compute_hash(&f_path);
 
@@ -220,7 +241,7 @@ fn process_file(args: &ThreadArgs, f: &RelativePath) {
                 }
             }
         }
-    }  else {
+    } else {
         println!("Starting {}", f_path.to_str().unwrap());
         db_hash = Some(("Adding", compute_hash(&f_path)));
     }
@@ -248,7 +269,7 @@ fn main() {
 
     for folder in args.folders.iter() {
         for f in find_files_in_directory(&base_path.join(folder), &args) {
-            let rel_path = f.strip_prefix(&base_path).unwrap().to_path_buf();
+            let rel_path: PathBuf = f.strip_prefix(&base_path).unwrap().to_path_buf();
             let p1 = RelativePathBuf::from_path(&rel_path).unwrap();
             files.insert(p1);
         }
@@ -260,24 +281,24 @@ fn main() {
 
     println!("Running with {} threads", args.processes);
 
+    let m_time_index = targs.file_db.lock().unwrap().modified_time;
+
     if args.processes == 0 {
         for f in files.iter() {
-            process_file(&targs, f);
+            process_file(&targs, f, m_time_index);
         }
     } else {
         let mut threads = Vec::new();
 
         for _ in 0..args.processes {
             let largs = targs.clone();
-            let thread = std::thread::spawn(move || {
-                loop {
-                    let val = largs.input_queue.lock().unwrap().pop_front();
+            let thread = std::thread::spawn(move || loop {
+                let val = largs.input_queue.lock().unwrap().pop_front();
 
-                    if let Some(f) = val {
-                        process_file(&largs, &f);
-                    } else {
-                        break;
-                    }
+                if let Some(f) = val {
+                    process_file(&largs, &f, m_time_index);
+                } else {
+                    break;
                 }
             });
             threads.push(thread);
