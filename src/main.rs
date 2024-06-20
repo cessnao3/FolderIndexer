@@ -14,6 +14,7 @@ enum ExistingFileAction {
     Nothing,
     Check,
     Update,
+    UpdateIfNewer,
 }
 
 /// File Indexing Program
@@ -33,7 +34,7 @@ struct Args {
     remove_old_entries: bool,
 
     /// Check all entries
-    #[clap(short, long, value_enum, default_value_t = ExistingFileAction::Nothing)]
+    #[clap(short, long, value_enum, default_value_t = ExistingFileAction::UpdateIfNewer)]
     existing: ExistingFileAction,
 
     /// Includes files and folders that start with a dot in the database
@@ -213,17 +214,25 @@ fn process_file(args: &ThreadArgs, f: &RelativePath, index_mtime: Option<SystemT
     let mut db_hash = None;
 
     if let Some(old_hash) = existing_hash {
-        let recompute_by_time = if let Some(it) = index_mtime {
-            if let Some(ft) = f_path.metadata().map_or(None, |m| m.modified().ok()) {
-                ft > it
+        // Determine whether we should recompute the file
+        let recompute = if args.existing_action == ExistingFileAction::UpdateIfNewer {
+            if let Some(it) = index_mtime {
+                if let Some(ft) = f_path.metadata().map_or(None, |m| m.modified().ok()) {
+                    ft > it
+                } else {
+                    println!(
+                        "Unable to find modification time for {f} - skipping time-based approach"
+                    );
+                    false
+                }
             } else {
                 false
             }
         } else {
-            false
+            args.existing_action != ExistingFileAction::Nothing
         };
 
-        if args.existing_action != ExistingFileAction::Nothing || recompute_by_time {
+        if recompute {
             println!("Computing {f}");
             let new_hash = compute_hash(&f_path);
 
@@ -233,6 +242,9 @@ fn process_file(args: &ThreadArgs, f: &RelativePath, index_mtime: Option<SystemT
                 match args.existing_action {
                     ExistingFileAction::Update => {
                         db_hash = Some(("  Updating!", new_hash));
+                    }
+                    ExistingFileAction::UpdateIfNewer => {
+                        db_hash = Some(("  Updating by Time!", new_hash));
                     }
                     ExistingFileAction::Check => {
                         *args.fail_due_to_difference.lock().unwrap() = true;
